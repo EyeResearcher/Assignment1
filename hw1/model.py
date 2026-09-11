@@ -1,5 +1,5 @@
+import gc
 import easydict
-import nltk
 from nltk.tokenize import word_tokenize  # for tokenization
 import numpy as np  # for numerical operators
 import matplotlib.pyplot as plt  # for plotting
@@ -11,13 +11,6 @@ from tqdm import tqdm  # progress bar
 from datasets import load_dataset
 from torch.utils.data import DataLoader, TensorDataset
 from typing import List, Tuple, Dict, Union
-from easydict import EasyDict
-
-# set random seeds
-random.seed(42)
-torch.manual_seed(42)
-
-nltk.download('punkt')
 
 """
 In the second part of the homework, we will build a simple sentiment classifier using PyTorch, with additional different word embeddings.
@@ -32,8 +25,8 @@ def load_data() -> Tuple[
     Dict[str, List[Union[int, str]]], Dict[str, List[Union[int, str]]], Dict[str, List[Union[int, str]]]]:
     # download dataset
     print(f"{'-' * 10} Load Dataset {'-' * 10}")
-    dataset = load_dataset("imdb")
-    dataset = dataset.shuffle()  # shuffle the data
+    dataset = load_dataset("stanfordnlp/imdb")
+    dataset = dataset.shuffle(seed=42)  # shuffle the data
     train_dataset = dataset['train']
     test_dataset = dataset['test']
 
@@ -57,35 +50,36 @@ Featurization
 """
 
 
-def featurize(sentence: str, embeddings: gensim.models.keyedvectors.KeyedVectors) -> Union[None, torch.FloatTensor]:
+def featurize(sentence: str, embeddings: dict) -> Union[None, torch.FloatTensor]:
     # sequence of word embeddings
     vectors = []
 
-    # map each word to its embedding
+    # Use the tokenizer supplied with the assignment.
     for word in word_tokenize(sentence.lower()):
-        try:
+        if word in embeddings:
             vectors.append(embeddings[word])
-        except KeyError:
-            pass
 
-    # TODO: complete the function to compute the average embedding of the sentence
-    # your return should be
-    # None - if the vector sequence is empty, i.e. the sentence is empty or None of the words in the sentence is in the embedding vocabulary
-    # A torch tensor of shape (embed_dim,) - the average word embedding of the sentence
-    # Hint: follow the hints in the pdf description
+    if len(vectors) == 0:
+        return None
+    avg_embedding = np.stack(vectors).mean(axis=0).astype(np.float32)
+    return torch.tensor(avg_embedding)
 
 
 def create_tensor_dataset(raw_data: Dict[str, List[Union[int, str]]],
-                          embeddings: gensim.models.keyedvectors.KeyedVectors) -> TensorDataset:
+                          embeddings: dict) -> TensorDataset:
+    if len(raw_data['text']) != len(raw_data['label']):
+        raise ValueError("Text and label counts must match.")
     all_features, all_labels = [], []
     for text, label in tqdm(zip(raw_data['text'], raw_data['label'])):
 
-        # TODO: complete the for loop to featurize each sentence
-        # only add the feature and label to the list if the feature is not None
-
-        # your code ends here
+        feature = featurize(text, embeddings)
+        if feature is not None:
+            all_features.append(feature)
+            all_labels.append(label)
 
     # stack all features and labels into two single tensors and create a TensorDataset
+    if not all_features:
+        raise ValueError("No reviews contain words in the embedding vocabulary.")
     features_tensor = torch.stack(all_features)
     labels_tensor = torch.tensor(all_labels, dtype=torch.long)
 
@@ -112,19 +106,12 @@ class SentimentClassifier(nn.Module):
         self.embed_dim = embed_dim
         self.num_classes = num_classes
 
-        # TODO: define the linear layer
-        # Hint: follow the hints in the pdf description
-
-        # your code ends here
+        self.linear = nn.Linear(embed_dim, num_classes)
 
         self.loss = nn.CrossEntropyLoss(reduction='mean')
 
     def forward(self, inp):
-        # TODO: complete the forward function
-        # Hint: follow the hints in the pdf description
-
-        # your code ends here
-
+        logits = self.linear(inp)
         return logits
 
 
@@ -135,14 +122,11 @@ Chain Everything Together: Training and Evaluation
 
 def accuracy(logits: torch.FloatTensor, labels: torch.LongTensor) -> torch.FloatTensor:
     assert logits.shape[0] == labels.shape[0]
-    # TODO: complete the function to compute the accuracy
-    # Hint: follow the hints in the pdf description, the return should be a tensor of 0s and 1s with the same shape as labels
-    # labels is a tensor of shape (batch_size,)
-    # logits is a tensor of shape (batch_size, num_classes)
-
-    return ...
+    predictions = torch.argmax(logits, dim=1)
+    return (predictions == labels).float()
 
 
+@torch.no_grad()
 def evaluate(model: SentimentClassifier, eval_dataloader: DataLoader) -> Tuple[float, float]:
     model.eval()
     eval_losses = []
@@ -153,10 +137,12 @@ def evaluate(model: SentimentClassifier, eval_dataloader: DataLoader) -> Tuple[f
         logits = model(inp)
         # loss and accuracy computation
         loss = model.loss(logits, labels)
-        eval_losses.append(loss.item())
+        eval_losses.append(loss.item() * labels.size(0))
         eval_accs += accuracy(logits, labels).tolist()
 
-    eval_loss, eval_acc = np.array(eval_losses).mean(), np.array(eval_accs).mean()
+    if not eval_accs:
+        raise ValueError("Evaluation dataloader is empty.")
+    eval_loss, eval_acc = sum(eval_losses) / len(eval_accs), float(np.mean(eval_accs))
     print(f"Eval Loss: {eval_loss} Eval Acc: {eval_acc}")
     return eval_loss, eval_acc
 
@@ -167,6 +153,8 @@ def train(model: SentimentClassifier,
           dev_dataloader: DataLoader,
           num_epochs: int,
           save_path: Union[str, None] = None):
+    if num_epochs < 1:
+        raise ValueError("num_epochs must be at least 1.")
     # record the training process and model performance for each epoch
     all_epoch_train_losses = []
     all_epoch_train_accs = []
@@ -191,10 +179,12 @@ def train(model: SentimentClassifier,
             loss.backward()
             optimizer.step()
             # record the loss and accuracy
-            train_losses.append(loss.item())
+            train_losses.append(loss.item() * labels.size(0))
             train_accs += accuracy(logits, labels).tolist()
 
-        all_epoch_train_losses.append(np.array(train_losses).mean())
+        if not train_accs:
+            raise ValueError("Training dataloader is empty.")
+        all_epoch_train_losses.append(sum(train_losses) / len(train_accs))
         all_epoch_train_accs.append(np.array(train_accs).mean())
 
         # evaluate on the dev set
@@ -241,16 +231,28 @@ def run(config: easydict.EasyDict,
         dev_data: Dict[str, List[Union[int, str]]],
         train_data: Dict[str, List[Union[int, str]]],
         test_data: Dict[str, List[Union[int, str]]]):
+    # Reset each experiment so results do not depend on previous runs.
+    seed = config.get('seed', 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if config.num_epochs < 1:
+        raise ValueError("num_epochs must be at least 1.")
+    if not config.save_path:
+        raise ValueError("run requires a save_path for the best checkpoint.")
     # download and load embeddings
     # it might take a few minutes
     print(f"{'-' * 10} Load Pre-trained Embeddings: {config.embeddings} {'-' * 10}")
     embeddings = gensim.downloader.load(config.embeddings)
+    vector_size = embeddings.vector_size
 
     # create datasets
     print(f"{'-' * 10} Create Datasets {'-' * 10}")
     train_dataset = create_tensor_dataset(train_data, embeddings)
     dev_dataset = create_tensor_dataset(dev_data, embeddings)
     test_dataset = create_tensor_dataset(test_data, embeddings)
+    del embeddings
+    gc.collect()
 
     print(f"{'-' * 10} Create Dataloaders {'-' * 10}")
     train_dataloader = create_dataloader(train_dataset, config.batch_size, shuffle=True)
@@ -258,7 +260,7 @@ def run(config: easydict.EasyDict,
     test_dataloader = create_dataloader(test_dataset, config.batch_size, shuffle=False)
 
     print(f"{'-' * 10} Load Model {'-' * 10}")
-    model = SentimentClassifier(embeddings.vector_size, config.num_classes)
+    model = SentimentClassifier(vector_size, config.num_classes)
     # define optimizer that manages the model's parameters and gradient updates
     # we will learn more about optimizers in future lectures and homework
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
@@ -266,7 +268,7 @@ def run(config: easydict.EasyDict,
     print(f"{'-' * 10} Start Training {'-' * 10}")
     all_epoch_train_losses, all_epoch_train_accs, all_epoch_dev_losses, all_epoch_dev_accs = (
         train(model, optimizer, train_dataloader, dev_dataloader, config.num_epochs, config.save_path))
-    model.load_state_dict(torch.load(config.save_path))
+    model.load_state_dict(torch.load(config.save_path, map_location="cpu", weights_only=True))
 
     print(f"{'-' * 10} Evaluate on Test Set {'-' * 10}")
     test_loss, test_acc = evaluate(model, test_dataloader)
